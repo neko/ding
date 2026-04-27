@@ -10,15 +10,31 @@
   it listens to helius enhanced websockets, decodes mpl core <code>createv2</code> instruction data, fetches the token metadata uri for the image, resolves primary sns names when present, and sends a compact discord embed.
 </p>
 
+<p align="center">
+  <a href="https://railway.com/new/github?repo=https%3A%2F%2Fgithub.com%2Fneko%2Fding"><img src="https://img.shields.io/badge/deploy%20on-railway-5016A1?logo=railway&logoColor=white" alt="Deploy on Railway"></a>
+</p>
+
 ## setup
 
 copy `.env.example` to `.env` and fill in the values.
 
 ```env
 HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=<API_KEY>
-HELIUS_WS_URL=wss://beta.helius-rpc.com/?api-key=<API_KEY>
+HELIUS_WS_URL=wss://mainnet.helius-rpc.com/?api-key=<API_KEY>
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<ID>/<TOKEN>
 ```
+
+## railway [![Deploy on Railway](https://img.shields.io/badge/deploy%20on-railway-5016A1?logo=railway&logoColor=white)](https://railway.com/new/github?repo=https%3A%2F%2Fgithub.com%2Fneko%2Fding)
+
+before the first deploy, add the required service variables from `.env.example`:
+
+```env
+HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=<API_KEY>
+HELIUS_WS_URL=wss://mainnet.helius-rpc.com/?api-key=<API_KEY>
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<ID>/<TOKEN>
+```
+
+railway uses `railway.json` to build with railpack and keep the monitor running as a long-lived worker.
 
 ## run
 
