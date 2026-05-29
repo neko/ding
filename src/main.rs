@@ -28,8 +28,8 @@ const DISCORD_GREY: u32 = 0x2b2d31;
 const HASH_PREFIX: &str = "SPL Name Service";
 const SNS_HEADER_LEN: usize = 96;
 const SOLSCAN_ACCOUNT: &str = "https://solscan.io/account/";
-const STANDARD_FETCH_ATTEMPTS: usize = 6;
-const STANDARD_FETCH_RETRY_DELAY: Duration = Duration::from_millis(500);
+const STANDARD_FETCH_ATTEMPTS: usize = 25;
+const STANDARD_FETCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_TEST_SIGNATURE: &str =
     "8UhRGNFLPzfSwsvVA5LFD7fpxdXxf9drCHn92GA4eJCfNXHDLM9ptgc8FfGi3EM1gQCB9fRzNrsECDh1ofrJRpA";
 
