@@ -101,14 +101,50 @@ async fn run_ws(
     sns: &mut SnsResolver,
     seen: &mut SeenSignatures,
 ) -> Result<()> {
-    let (ws, _) = connect_async(config.ws_url.as_str()).await?;
-    let (mut write, mut read) = ws.split();
+    let safe_ws_url = redact_url(&config.ws_url);
+    info!(
+        mode = config.ws_mode.as_str(),
+        url = %safe_ws_url,
+        "connecting websocket"
+    );
 
+    let (ws, _) = connect_async(config.ws_url.as_str())
+        .await
+        .with_context(|| {
+            format!(
+                "websocket connect failed: mode={} url={}",
+                config.ws_mode.as_str(),
+                safe_ws_url
+            )
+        })?;
+    let (mut write, mut read) = ws.split();
+    info!(
+        mode = config.ws_mode.as_str(),
+        url = %safe_ws_url,
+        "websocket connected"
+    );
+
+    let subscription = subscription_request(config);
+    let method = subscription
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    info!(
+        mode = config.ws_mode.as_str(),
+        method = method,
+        fee_account = %config.fee_account,
+        "sending websocket subscription"
+    );
     write
-        .send(Message::Text(
-            subscription_request(config).to_string().into(),
-        ))
-        .await?;
+        .send(Message::Text(subscription.to_string().into()))
+        .await
+        .with_context(|| {
+            format!(
+                "websocket subscription send failed: mode={} url={}",
+                config.ws_mode.as_str(),
+                safe_ws_url
+            )
+        })?;
     info!(
         mode = config.ws_mode.as_str(),
         fee_account = %config.fee_account,
@@ -121,19 +157,37 @@ async fn run_ws(
 
     loop {
         tokio::select! {
-            _ = ping.tick() => write.send(Message::Ping(Vec::new().into())).await?,
+            _ = ping.tick() => write.send(Message::Ping(Vec::new().into())).await.with_context(|| {
+                format!(
+                    "websocket ping failed: mode={} url={}",
+                    config.ws_mode.as_str(),
+                    safe_ws_url
+                )
+            })?,
             _ = stats.tick() => {
                 info!("seen {txs_seen} txs");
                 txs_seen = 0;
             }
             message = read.next() => {
-                match message.transpose()? {
+                match message.transpose().with_context(|| {
+                    format!(
+                        "websocket read failed: mode={} url={}",
+                        config.ws_mode.as_str(),
+                        safe_ws_url
+                    )
+                })? {
                     Some(Message::Text(text)) => {
                         if handle_ws_text(text.as_ref(), config, client, sns, seen).await? {
                             txs_seen += 1;
                         }
                     }
-                    Some(Message::Ping(payload)) => write.send(Message::Pong(payload)).await?,
+                    Some(Message::Ping(payload)) => write.send(Message::Pong(payload)).await.with_context(|| {
+                        format!(
+                            "websocket pong failed: mode={} url={}",
+                            config.ws_mode.as_str(),
+                            safe_ws_url
+                        )
+                    })?,
                     Some(Message::Close(frame)) => bail!("websocket closed: {frame:?}"),
                     Some(_) => {}
                     None => bail!("websocket stream ended"),
@@ -254,7 +308,14 @@ async fn handle_standard_ws_payload(
         return Ok(true);
     }
 
-    let transaction = fetch_transaction(client, &config.rpc_url, signature).await?;
+    info!(
+        signature,
+        rpc_url = %redact_url(&config.rpc_url),
+        "standard websocket candidate matched; fetching transaction"
+    );
+    let transaction = fetch_transaction(client, &config.rpc_url, signature)
+        .await
+        .with_context(|| format!("standard websocket transaction fetch failed: {signature}"))?;
     process_transaction_result(&transaction, signature, config, client, sns).await?;
     Ok(true)
 }
@@ -303,7 +364,8 @@ async fn send_test_webhook(config: &Config, client: &Client, sns: &mut SnsResolv
 }
 
 async fn fetch_transaction(client: &Client, rpc_url: &str, signature: &str) -> Result<Value> {
-    let response: Value = client
+    let safe_rpc_url = redact_url(rpc_url);
+    let response = client
         .post(rpc_url)
         .json(&json!({
             "jsonrpc": "2.0",
@@ -315,13 +377,38 @@ async fn fetch_transaction(client: &Client, rpc_url: &str, signature: &str) -> R
             ]
         }))
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "getTransaction request failed: url={} signature={} error={}",
+                safe_rpc_url,
+                signature,
+                err.without_url()
+            )
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "getTransaction HTTP {status}: url={} signature={} body={}",
+            safe_rpc_url,
+            signature,
+            compact_body(&body)
+        );
+    }
+
+    let response: Value = response
         .json()
-        .await?;
+        .await
+        .with_context(|| format!("getTransaction JSON parse failed: url={safe_rpc_url}"))?;
 
     if let Some(error) = response.get("error") {
-        bail!("getTransaction RPC error: {error}");
+        bail!(
+            "getTransaction RPC error: url={} signature={} error={error}",
+            safe_rpc_url,
+            signature
+        );
     }
 
     response
@@ -622,6 +709,24 @@ fn env_first(primary: &str, fallback: &str) -> Result<String> {
 
 fn required_env(key: &str) -> Result<String> {
     env::var(key).with_context(|| format!("missing {key}"))
+}
+
+fn redact_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, _)) => format!("{base}?<redacted>"),
+        None => url.to_owned(),
+    }
+}
+
+fn compact_body(body: &str) -> String {
+    let body = body.trim();
+    let mut chars = body.chars();
+    let compact: String = chars.by_ref().take(240).collect();
+    if chars.next().is_some() {
+        format!("{compact}...")
+    } else {
+        body.to_owned()
+    }
 }
 
 #[derive(Debug)]
@@ -953,5 +1058,17 @@ mod tests {
             "Program 11111111111111111111111111111111 invoke [1]",
             "Program log: Instruction: Transfer"
         ]))));
+    }
+
+    #[test]
+    fn redacts_url_query_strings() {
+        assert_eq!(
+            redact_url("wss://mainnet.helius-rpc.com/?api-key=secret"),
+            "wss://mainnet.helius-rpc.com/?<redacted>"
+        );
+        assert_eq!(
+            redact_url("https://api.example/path"),
+            "https://api.example/path"
+        );
     }
 }
