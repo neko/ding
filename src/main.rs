@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const MPL_CORE_PROGRAM_ID: &str = "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d";
+const FAMOUS_FOX_FEE_ACCOUNT: &str = "98Ni7vVRR1tggtWWruPVcfFXHTH11bPbNryJZGkCGvaD";
 const DING_NAME: &str = "DING!";
 const DING_DESCRIPTION_MARKER: &str = "famousfoxes.com";
 const DISCORD_GREY: u32 = 0x2b2d31;
@@ -67,7 +68,7 @@ async fn main() -> Result<()> {
         .build()?;
 
     let mut seen = SeenSignatures::new(2_048);
-    let mut sns = SnsResolver::new(client.clone(), config.helius_rpc_url.clone());
+    let mut sns = SnsResolver::new(client.clone(), config.rpc_url.clone());
     let mut reconnect_delay = Duration::from_secs(1);
 
     if config.test_webhook {
@@ -100,13 +101,19 @@ async fn run_ws(
     sns: &mut SnsResolver,
     seen: &mut SeenSignatures,
 ) -> Result<()> {
-    let (ws, _) = connect_async(config.helius_ws_url.as_str()).await?;
+    let (ws, _) = connect_async(config.ws_url.as_str()).await?;
     let (mut write, mut read) = ws.split();
 
     write
-        .send(Message::Text(subscription_request().to_string().into()))
+        .send(Message::Text(
+            subscription_request(config).to_string().into(),
+        ))
         .await?;
-    info!("subscribed to mpl core createv2 candidates");
+    info!(
+        mode = config.ws_mode.as_str(),
+        fee_account = %config.fee_account,
+        "subscribed to mpl core ding candidates"
+    );
 
     let mut ping = time::interval(Duration::from_secs(60));
     let mut stats = time::interval(Duration::from_secs(5));
@@ -136,25 +143,36 @@ async fn run_ws(
     }
 }
 
-fn subscription_request() -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "transactionSubscribe",
-        "params": [
-            {
-                "failed": false,
-                "accountInclude": [MPL_CORE_PROGRAM_ID]
-            },
-            {
-                "commitment": "confirmed",
-                "encoding": "jsonParsed",
-                "transactionDetails": "full",
-                "showRewards": false,
-                "maxSupportedTransactionVersion": 0
-            }
-        ]
-    })
+fn subscription_request(config: &Config) -> Value {
+    match config.ws_mode {
+        WsMode::Enhanced => json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "transactionSubscribe",
+            "params": [
+                {
+                    "failed": false,
+                    "accountRequired": [MPL_CORE_PROGRAM_ID, config.fee_account.as_str()]
+                },
+                {
+                    "commitment": "confirmed",
+                    "encoding": "jsonParsed",
+                    "transactionDetails": "full",
+                    "showRewards": false,
+                    "maxSupportedTransactionVersion": 0
+                }
+            ]
+        }),
+        WsMode::Standard => json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "logsSubscribe",
+            "params": [
+                { "mentions": [config.fee_account.as_str()] },
+                { "commitment": "confirmed" }
+            ]
+        }),
+    }
 }
 
 async fn handle_ws_text(
@@ -168,11 +186,27 @@ async fn handle_ws_text(
 
     if payload.get("id").and_then(Value::as_i64) == Some(1) {
         if let Some(subscription_id) = payload.get("result") {
-            info!("transaction subscription id: {subscription_id}");
+            info!(
+                mode = config.ws_mode.as_str(),
+                "websocket subscription id: {subscription_id}"
+            );
         }
         return Ok(false);
     }
 
+    match config.ws_mode {
+        WsMode::Enhanced => handle_enhanced_ws_payload(&payload, config, client, sns, seen).await,
+        WsMode::Standard => handle_standard_ws_payload(&payload, config, client, sns, seen).await,
+    }
+}
+
+async fn handle_enhanced_ws_payload(
+    payload: &Value,
+    config: &Config,
+    client: &Client,
+    sns: &mut SnsResolver,
+    seen: &mut SeenSignatures,
+) -> Result<bool> {
     if payload.get("method").and_then(Value::as_str) != Some("transactionNotification") {
         return Ok(false);
     }
@@ -188,12 +222,56 @@ async fn handle_ws_text(
         return Ok(true);
     }
 
+    process_transaction_result(result, signature, config, client, sns).await?;
+    Ok(true)
+}
+
+async fn handle_standard_ws_payload(
+    payload: &Value,
+    config: &Config,
+    client: &Client,
+    sns: &mut SnsResolver,
+    seen: &mut SeenSignatures,
+) -> Result<bool> {
+    if payload.get("method").and_then(Value::as_str) != Some("logsNotification") {
+        return Ok(false);
+    }
+
+    let Some(value) = payload.pointer("/params/result/value") else {
+        return Ok(false);
+    };
+    if value.get("err").is_some_and(|err| !err.is_null()) {
+        return Ok(true);
+    }
+
+    let Some(signature) = value.get("signature").and_then(Value::as_str) else {
+        return Ok(true);
+    };
+    if !logs_contain_ding_candidate(value.get("logs")) {
+        return Ok(true);
+    }
+    if !seen.insert(signature) {
+        return Ok(true);
+    }
+
+    let transaction = fetch_transaction(client, &config.rpc_url, signature).await?;
+    process_transaction_result(&transaction, signature, config, client, sns).await?;
+    Ok(true)
+}
+
+async fn process_transaction_result(
+    result: &Value,
+    signature: &str,
+    config: &Config,
+    client: &Client,
+    sns: &mut SnsResolver,
+) -> Result<()> {
     let Some(candidate) = extract_asset_candidate(result) else {
         debug!(
             signature,
             "createv2 log without expected mpl core instruction shape"
         );
-        return Ok(true);
+        return Ok(());
     };
 
     info!(signature, asset = %candidate.asset, "processing ding candidate");
@@ -203,7 +281,7 @@ async fn handle_ws_text(
         None => debug!(signature, asset = candidate.asset, "not a famous fox ding"),
     }
 
-    Ok(true)
+    Ok(())
 }
 
 async fn send_test_webhook(config: &Config, client: &Client, sns: &mut SnsResolver) -> Result<()> {
@@ -211,7 +289,7 @@ async fn send_test_webhook(config: &Config, client: &Client, sns: &mut SnsResolv
         .test_signature
         .as_deref()
         .unwrap_or(DEFAULT_TEST_SIGNATURE);
-    let transaction = fetch_transaction(client, &config.helius_rpc_url, signature).await?;
+    let transaction = fetch_transaction(client, &config.rpc_url, signature).await?;
     let candidate = extract_asset_candidate(&transaction).with_context(|| {
         format!("test transaction has no MPL Core asset candidate: {signature}")
     })?;
@@ -311,6 +389,21 @@ fn extract_asset_candidate(result: &Value) -> Option<AssetCandidate> {
             uri: create_v2.uri,
         })
     })
+}
+
+fn logs_contain_ding_candidate(logs: Option<&Value>) -> bool {
+    let Some(logs) = logs.and_then(Value::as_array) else {
+        return false;
+    };
+
+    let mut has_core = false;
+    let mut has_create_v2 = false;
+    for log in logs.iter().filter_map(Value::as_str) {
+        has_core |= log.contains(MPL_CORE_PROGRAM_ID);
+        has_create_v2 |= log.contains("Instruction: CreateV2");
+    }
+
+    has_core && has_create_v2
 }
 
 fn decode_create_v2_data(data: &str) -> Option<CreateV2Data> {
@@ -451,8 +544,10 @@ fn abbreviate(address: &str) -> String {
 }
 
 struct Config {
-    helius_rpc_url: String,
-    helius_ws_url: String,
+    rpc_url: String,
+    ws_url: String,
+    ws_mode: WsMode,
+    fee_account: String,
     discord_webhook_url: String,
     test_webhook: bool,
     test_signature: Option<String>,
@@ -476,13 +571,53 @@ impl Config {
         }
 
         Ok(Self {
-            helius_rpc_url: required_env("HELIUS_RPC_URL")?,
-            helius_ws_url: required_env("HELIUS_WS_URL")?,
+            rpc_url: env_first("SOLANA_RPC_URL", "HELIUS_RPC_URL")?,
+            ws_url: env_first("SOLANA_WS_URL", "HELIUS_WS_URL")?,
+            ws_mode: optional_env("DING_WS_MODE")
+                .as_deref()
+                .map(WsMode::parse)
+                .transpose()?
+                .unwrap_or(WsMode::Enhanced),
+            fee_account: optional_env("DING_FEE_ACCOUNT")
+                .unwrap_or_else(|| FAMOUS_FOX_FEE_ACCOUNT.to_owned()),
             discord_webhook_url: required_env("DISCORD_WEBHOOK_URL")?,
             test_webhook,
             test_signature,
         })
     }
+}
+
+#[derive(Clone, Copy)]
+enum WsMode {
+    Enhanced,
+    Standard,
+}
+
+impl WsMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "enhanced" | "helius" => Ok(Self::Enhanced),
+            "standard" | "normal" | "solana" => Ok(Self::Standard),
+            _ => bail!("DING_WS_MODE must be enhanced or standard"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enhanced => "enhanced",
+            Self::Standard => "standard",
+        }
+    }
+}
+
+fn optional_env(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|value| !value.is_empty())
+}
+
+fn env_first(primary: &str, fallback: &str) -> Result<String> {
+    optional_env(primary)
+        .or_else(|| optional_env(fallback))
+        .with_context(|| format!("missing {primary} or {fallback}"))
 }
 
 fn required_env(key: &str) -> Result<String> {
@@ -727,6 +862,18 @@ fn deserialize_reverse(data: &[u8]) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn test_config(ws_mode: WsMode) -> Config {
+        Config {
+            rpc_url: "https://rpc.example".to_owned(),
+            ws_url: "wss://ws.example".to_owned(),
+            ws_mode,
+            fee_account: FAMOUS_FOX_FEE_ACCOUNT.to_owned(),
+            discord_webhook_url: "https://discord.example".to_owned(),
+            test_webhook: false,
+            test_signature: None,
+        }
+    }
+
     #[test]
     fn extracts_mpl_core_candidate() {
         let payload = json!({
@@ -766,5 +913,45 @@ mod tests {
             abbreviate("jewishBC8etWX2663FW5CEQErVnP28ftRsfhJEShvwn"),
             "jewi...hvwn"
         );
+    }
+
+    #[test]
+    fn builds_enhanced_subscription_with_required_accounts() {
+        let request = subscription_request(&test_config(WsMode::Enhanced));
+
+        assert_eq!(
+            request.get("method").and_then(Value::as_str),
+            Some("transactionSubscribe")
+        );
+        assert_eq!(
+            request.pointer("/params/0/accountRequired"),
+            Some(&json!([MPL_CORE_PROGRAM_ID, FAMOUS_FOX_FEE_ACCOUNT]))
+        );
+    }
+
+    #[test]
+    fn builds_standard_subscription_with_fee_mention() {
+        let request = subscription_request(&test_config(WsMode::Standard));
+
+        assert_eq!(
+            request.get("method").and_then(Value::as_str),
+            Some("logsSubscribe")
+        );
+        assert_eq!(
+            request.pointer("/params/0/mentions"),
+            Some(&json!([FAMOUS_FOX_FEE_ACCOUNT]))
+        );
+    }
+
+    #[test]
+    fn filters_standard_logs_to_core_create_v2() {
+        assert!(logs_contain_ding_candidate(Some(&json!([
+            format!("Program {MPL_CORE_PROGRAM_ID} invoke [1]"),
+            "Program log: Instruction: CreateV2"
+        ]))));
+        assert!(!logs_contain_ding_candidate(Some(&json!([
+            "Program 11111111111111111111111111111111 invoke [1]",
+            "Program log: Instruction: Transfer"
+        ]))));
     }
 }
