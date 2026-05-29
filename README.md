@@ -58,6 +58,12 @@ send a test webhook from a specific tx:
 cargo run -- -t <signature>
 ```
 
+send a test webhook once on startup:
+
+```env
+DING_TEST_SIGNATURE=<signature>
+```
+
 ## env
 
 `HELIUS_RPC_URL` is used for test tx fetches and sns account lookups.
@@ -72,7 +78,7 @@ cargo run -- -t <signature>
 
 `DISCORD_WEBHOOK_URL` is where ding embeds are sent.
 
-`DING_TEST_SIGNATURE` optionally overrides the default test tx.
+`DING_TEST_SIGNATURE` sends a test webhook once on startup using that tx.
 
 standard websocket mode example:
 

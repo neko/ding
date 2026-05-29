@@ -28,6 +28,8 @@ const DISCORD_GREY: u32 = 0x2b2d31;
 const HASH_PREFIX: &str = "SPL Name Service";
 const SNS_HEADER_LEN: usize = 96;
 const SOLSCAN_ACCOUNT: &str = "https://solscan.io/account/";
+const STANDARD_FETCH_ATTEMPTS: usize = 6;
+const STANDARD_FETCH_RETRY_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_TEST_SIGNATURE: &str =
     "8UhRGNFLPzfSwsvVA5LFD7fpxdXxf9drCHn92GA4eJCfNXHDLM9ptgc8FfGi3EM1gQCB9fRzNrsECDh1ofrJRpA";
 
@@ -313,10 +315,21 @@ async fn handle_standard_ws_payload(
         rpc_url = %redact_url(&config.rpc_url),
         "standard websocket candidate matched; fetching transaction"
     );
-    let transaction = fetch_transaction(client, &config.rpc_url, signature)
-        .await
-        .with_context(|| format!("standard websocket transaction fetch failed: {signature}"))?;
-    process_transaction_result(&transaction, signature, config, client, sns).await?;
+    let transaction = match fetch_transaction_with_retry(client, &config.rpc_url, signature).await {
+        Ok(transaction) => transaction,
+        Err(err) => {
+            warn!(
+                signature,
+                "standard websocket transaction fetch failed: {err:#}"
+            );
+            return Ok(true);
+        }
+    };
+
+    if let Err(err) = process_transaction_result(&transaction, signature, config, client, sns).await
+    {
+        warn!(signature, "standard websocket candidate failed: {err:#}");
+    }
     Ok(true)
 }
 
@@ -364,6 +377,40 @@ async fn send_test_webhook(config: &Config, client: &Client, sns: &mut SnsResolv
 }
 
 async fn fetch_transaction(client: &Client, rpc_url: &str, signature: &str) -> Result<Value> {
+    fetch_transaction_maybe(client, rpc_url, signature)
+        .await?
+        .with_context(|| format!("transaction not found: {signature}"))
+}
+
+async fn fetch_transaction_with_retry(
+    client: &Client,
+    rpc_url: &str,
+    signature: &str,
+) -> Result<Value> {
+    for attempt in 1..=STANDARD_FETCH_ATTEMPTS {
+        if let Some(transaction) = fetch_transaction_maybe(client, rpc_url, signature).await? {
+            return Ok(transaction);
+        }
+
+        if attempt < STANDARD_FETCH_ATTEMPTS {
+            info!(
+                signature,
+                attempt,
+                delay_ms = STANDARD_FETCH_RETRY_DELAY.as_millis(),
+                "transaction not found yet; retrying"
+            );
+            time::sleep(STANDARD_FETCH_RETRY_DELAY).await;
+        }
+    }
+
+    bail!("transaction not found after {STANDARD_FETCH_ATTEMPTS} attempts: {signature}")
+}
+
+async fn fetch_transaction_maybe(
+    client: &Client,
+    rpc_url: &str,
+    signature: &str,
+) -> Result<Option<Value>> {
     let safe_rpc_url = redact_url(rpc_url);
     let response = client
         .post(rpc_url)
@@ -411,11 +458,10 @@ async fn fetch_transaction(client: &Client, rpc_url: &str, signature: &str) -> R
         );
     }
 
-    response
+    Ok(response
         .get("result")
         .filter(|result| !result.is_null())
-        .cloned()
-        .with_context(|| format!("transaction not found: {signature}"))
+        .cloned())
 }
 
 async fn build_ding_event(
@@ -642,10 +688,8 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let mut test_webhook = false;
-        let mut test_signature = env::var("DING_TEST_SIGNATURE")
-            .ok()
-            .filter(|value| !value.is_empty());
+        let mut test_signature = optional_env("DING_TEST_SIGNATURE");
+        let mut test_webhook = test_signature.is_some();
         let mut args = env::args().skip(1);
 
         while let Some(arg) = args.next() {
