@@ -25,6 +25,7 @@ const FAMOUS_FOX_FEE_ACCOUNT: &str = "98Ni7vVRR1tggtWWruPVcfFXHTH11bPbNryJZGkCGv
 const DING_NAME: &str = "DING!";
 const DING_DESCRIPTION_MARKER: &str = "famousfoxes.com";
 const DISCORD_GREY: u32 = 0x2b2d31;
+const IPFS_GATEWAY: &str = "https://gateway.pinata.cloud";
 const HASH_PREFIX: &str = "SPL Name Service";
 const SNS_HEADER_LEN: usize = 96;
 const SOLSCAN_ACCOUNT: &str = "https://solscan.io/account/";
@@ -75,6 +76,9 @@ async fn main() -> Result<()> {
 
     if config.test_webhook {
         send_test_webhook(&config, &client, &mut sns).await?;
+        if config.send_only {
+            return Ok(());
+        }
     }
 
     loop {
@@ -589,9 +593,19 @@ fn account_at(accounts: &[Value], index: usize) -> Option<String> {
     accounts.get(index)?.as_str().map(ToOwned::to_owned)
 }
 
+fn ipfs_gateway_url(url: &str) -> String {
+    if let Some(path) = url.strip_prefix("ipfs://") {
+        format!("{IPFS_GATEWAY}/ipfs/{path}")
+    } else if let Some(path) = url.strip_prefix("https://ipfs.io/ipfs/") {
+        format!("{IPFS_GATEWAY}/ipfs/{path}")
+    } else {
+        url.to_owned()
+    }
+}
+
 async fn fetch_ding(client: &Client, candidate: &AssetCandidate) -> Result<Option<DingEvent>> {
     let metadata: Value = client
-        .get(&candidate.uri)
+        .get(ipfs_gateway_url(&candidate.uri))
         .send()
         .await?
         .error_for_status()?
@@ -605,16 +619,17 @@ async fn fetch_ding(client: &Client, candidate: &AssetCandidate) -> Result<Optio
         return Ok(None);
     }
 
-    let image = metadata
-        .get("image")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            metadata
-                .pointer("/properties/files/0/uri")
-                .and_then(Value::as_str)
-        })
-        .context("Ding metadata missing image")?
-        .to_owned();
+    let image = ipfs_gateway_url(
+        metadata
+            .get("image")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                metadata
+                    .pointer("/properties/files/0/uri")
+                    .and_then(Value::as_str)
+            })
+            .context("Ding metadata missing image")?,
+    );
     let sender = metadata
         .get("attributes")
         .and_then(Value::as_array)
@@ -684,6 +699,7 @@ struct Config {
     discord_webhook_url: String,
     test_webhook: bool,
     test_signature: Option<String>,
+    send_only: bool,
 }
 
 impl Config {
@@ -714,6 +730,7 @@ impl Config {
             discord_webhook_url: required_env("DISCORD_WEBHOOK_URL")?,
             test_webhook,
             test_signature,
+            send_only: optional_env("DING_SEND_ONLY").is_some(),
         })
     }
 }
